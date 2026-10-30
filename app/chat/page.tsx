@@ -1,7 +1,7 @@
 
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "../../lib/supabase/client";
 
@@ -11,6 +11,7 @@ type Profile = {
   full_name: string | null;
   avatar_url: string | null;
   is_online: boolean | null;
+  last_seen?: string | null;
 };
 
 type Message = {
@@ -24,9 +25,11 @@ type Message = {
 export default function ChatPage() {
   const router = useRouter();
   const bottomRef = useRef<HTMLDivElement>(null);
+  const channelRef = useRef<any>(null);
 
   const [myId, setMyId] = useState("");
   const [myEmail, setMyEmail] = useState("");
+  const [myProfile, setMyProfile] = useState<Profile | null>(null);
   const [people, setPeople] = useState<Profile[]>([]);
   const [selected, setSelected] = useState<Profile | null>(null);
   const [conversationId, setConversationId] = useState("");
@@ -34,54 +37,97 @@ export default function ChatPage() {
   const [search, setSearch] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
+  const [opening, setOpening] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const [mobileChat, setMobileChat] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
 
+  const getError = (err: any) =>
+    err?.message || err?.details || err?.hint || "An unexpected error occurred.";
+
+  const loadMessages = useCallback(async (id: string) => {
+    const { data, error } = await supabase
+      .from("messages")
+      .select("id, content, sender_id, created_at, message_type")
+      .eq("conversation_id", id)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      setError("Could not load messages: " + getError(error));
+      return;
+    }
+
+    setMessages(data || []);
+  }, []);
+
+  // Load authenticated user and people.
   useEffect(() => {
     let active = true;
 
-    async function start() {
-      const { data, error } = await supabase.auth.getUser();
+    async function initialize() {
+      try {
+        const { data, error } = await supabase.auth.getUser();
 
-      if (error || !data.user) {
-        router.replace("/");
-        return;
+        if (error || !data.user) {
+          router.replace("/");
+          return;
+        }
+
+        if (!active) return;
+
+        const currentUser = data.user;
+        setMyId(currentUser.id);
+        setMyEmail(currentUser.email || "");
+
+        const { data: profile } = await supabase
+          .from("profiles")
+          .select("id, username, full_name, avatar_url, is_online, last_seen")
+          .eq("id", currentUser.id)
+          .maybeSingle();
+
+        if (active && profile) setMyProfile(profile);
+
+        await supabase
+          .from("profiles")
+          .update({
+            is_online: true,
+            last_seen: new Date().toISOString(),
+          })
+          .eq("id", currentUser.id);
+
+        const { data: users, error: usersError } = await supabase
+          .from("profiles")
+          .select("id, username, full_name, avatar_url, is_online, last_seen")
+          .neq("id", currentUser.id)
+          .order("full_name", { ascending: true })
+          .limit(100);
+
+        if (!active) return;
+
+        if (usersError) {
+          setError("Could not load people: " + getError(usersError));
+        } else {
+          setPeople(users || []);
+        }
+      } catch (err) {
+        if (active) setError(getError(err));
+      } finally {
+        if (active) setLoading(false);
       }
-
-      if (!active) return;
-
-      setMyId(data.user.id);
-      setMyEmail(data.user.email || "");
-
-      await supabase
-        .from("profiles")
-        .update({
-          is_online: true,
-          last_seen: new Date().toISOString(),
-        })
-        .eq("id", data.user.id);
-
-      const { data: users, error: usersError } = await supabase
-        .from("profiles")
-        .select("id, username, full_name, avatar_url, is_online")
-        .neq("id", data.user.id)
-        .order("full_name", { ascending: true });
-
-      if (!active) return;
-
-      if (usersError) {
-        setError(usersError.message);
-      } else {
-        setPeople(users || []);
-      }
-
-      setLoading(false);
     }
 
-    start();
+    initialize();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!session) router.replace("/");
+    });
 
     return () => {
       active = false;
+      subscription.unsubscribe();
     };
   }, [router]);
 
@@ -89,55 +135,60 @@ export default function ChatPage() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Find an existing private conversation or create one.
   async function openChat(person: Profile) {
+    if (!myId || opening) return;
+
+    setOpening(true);
+    setError("");
     setSelected(person);
+    setMobileChat(true);
     setMessages([]);
     setConversationId("");
-    setError("");
 
     try {
-      // Find conversations where I am a member.
-      const { data: myMemberships, error: memberError } =
+      const { data: memberships, error: membershipError } =
         await supabase
           .from("conversation_members")
           .select("conversation_id")
           .eq("user_id", myId);
 
-      if (memberError) throw memberError;
+      if (membershipError) throw membershipError;
 
-      let existingId = "";
+      let foundId = "";
 
-      for (const membership of myMemberships || []) {
+      for (const membership of memberships || []) {
+        const id = membership.conversation_id;
+
         const { data: conversation, error: conversationError } =
           await supabase
             .from("conversations")
             .select("id, type")
-            .eq("id", membership.conversation_id)
+            .eq("id", id)
             .maybeSingle();
 
         if (conversationError) throw conversationError;
         if (!conversation || conversation.type !== "private") continue;
 
-        const { data: members, error: otherMemberError } =
+        const { data: members, error: membersError } =
           await supabase
             .from("conversation_members")
             .select("user_id")
-            .eq("conversation_id", membership.conversation_id);
+            .eq("conversation_id", id);
 
-        if (otherMemberError) throw otherMemberError;
+        if (membersError) throw membersError;
 
-        const hasOtherPerson = (members || []).some(
-          (member) => member.user_id === person.id
-        );
+        const isTwoPersonChat =
+          (members || []).some((m) => m.user_id === person.id) &&
+          (members || []).some((m) => m.user_id === myId);
 
-        if (hasOtherPerson) {
-          existingId = membership.conversation_id;
+        if (isTwoPersonChat && (members || []).length === 2) {
+          foundId = id;
           break;
         }
       }
 
-      // Create a private conversation if one does not exist.
-      if (!existingId) {
+      if (!foundId) {
         const { data: conversation, error: createError } =
           await supabase
             .from("conversations")
@@ -151,18 +202,18 @@ export default function ChatPage() {
 
         if (createError) throw createError;
 
-        existingId = conversation.id;
+        foundId = conversation.id;
 
         const { error: addMembersError } = await supabase
           .from("conversation_members")
           .insert([
             {
-              conversation_id: existingId,
+              conversation_id: foundId,
               user_id: myId,
               role: "member",
             },
             {
-              conversation_id: existingId,
+              conversation_id: foundId,
               user_id: person.id,
               role: "member",
             },
@@ -171,35 +222,26 @@ export default function ChatPage() {
         if (addMembersError) throw addMembersError;
       }
 
-      setConversationId(existingId);
-      await loadMessages(existingId);
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Could not open chat."
-      );
+      setConversationId(foundId);
+      await loadMessages(foundId);
+    } catch (err: any) {
+      console.error("OPEN CHAT ERROR:", err);
+      setError("Could not open chat: " + getError(err));
+    } finally {
+      setOpening(false);
     }
   }
 
-  async function loadMessages(id: string) {
-    const { data, error } = await supabase
-      .from("messages")
-      .select("id, content, sender_id, created_at, message_type")
-      .eq("conversation_id", id)
-      .order("created_at", { ascending: true });
-
-    if (error) {
-      setError(error.message);
-      return;
-    }
-
-    setMessages(data || []);
-  }
-
+  // Realtime updates for the selected conversation.
   useEffect(() => {
     if (!conversationId) return;
 
+    if (channelRef.current) {
+      supabase.removeChannel(channelRef.current);
+    }
+
     const channel = supabase
-      .channel("messages-" + conversationId)
+      .channel("imran-messages-" + conversationId)
       .on(
         "postgres_changes",
         {
@@ -210,86 +252,119 @@ export default function ChatPage() {
         },
         (payload) => {
           if (payload.eventType === "INSERT") {
-            const newMessage = payload.new as Message;
+            const incoming = payload.new as Message;
 
-            setMessages((current) => {
-              if (current.some((item) => item.id === newMessage.id)) {
-                return current;
+            setMessages((previous) => {
+              if (previous.some((m) => m.id === incoming.id)) {
+                return previous;
               }
-              return [...current, newMessage];
+              return [...previous, incoming];
             });
           } else {
             loadMessages(conversationId);
           }
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        if (status === "CHANNEL_ERROR") {
+          setError("Realtime connection failed. Check Supabase Realtime settings.");
+        }
+      });
+
+    channelRef.current = channel;
 
     return () => {
       supabase.removeChannel(channel);
+      channelRef.current = null;
     };
-  }, [conversationId]);
+  }, [conversationId, loadMessages]);
 
+  // Send a text message.
   async function sendMessage(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
 
     const content = message.trim();
 
-    if (!content || !conversationId || sending) return;
+    if (!content || !conversationId || !myId || sending) return;
 
     setSending(true);
     setError("");
 
-    const { data, error } = await supabase
-      .from("messages")
-      .insert({
-        conversation_id: conversationId,
-        sender_id: myId,
-        content,
-        message_type: "text",
-      })
-      .select("id, content, sender_id, created_at, message_type")
-      .single();
+    try {
+      const { data, error } = await supabase
+        .from("messages")
+        .insert({
+          conversation_id: conversationId,
+          sender_id: myId,
+          content,
+          message_type: "text",
+        })
+        .select("id, content, sender_id, created_at, message_type")
+        .single();
 
-    if (error) {
-      setError(error.message);
-    } else {
+      if (error) throw error;
+
       setMessage("");
-      setMessages((current) => {
-        if (current.some((item) => item.id === data.id)) {
-          return current;
-        }
-        return [...current, data];
-      });
-    }
 
-    setSending(false);
+      setMessages((previous) => {
+        if (previous.some((m) => m.id === data.id)) return previous;
+        return [...previous, data];
+      });
+    } catch (err: any) {
+      console.error("SEND MESSAGE ERROR:", err);
+      setError("Message not sent: " + getError(err));
+    } finally {
+      setSending(false);
+    }
   }
 
   async function logout() {
-    await supabase
-      .from("profiles")
-      .update({
-        is_online: false,
-        last_seen: new Date().toISOString(),
-      })
-      .eq("id", myId);
+    if (loggingOut) return;
 
-    await supabase.auth.signOut();
-    router.replace("/");
+    setLoggingOut(true);
+
+    try {
+      if (myId) {
+        await supabase
+          .from("profiles")
+          .update({
+            is_online: false,
+            last_seen: new Date().toISOString(),
+          })
+          .eq("id", myId);
+      }
+
+      await supabase.auth.signOut();
+      router.replace("/");
+    } catch (err) {
+      setError(getError(err));
+      setLoggingOut(false);
+    }
   }
 
-  const filteredPeople = people.filter((person) =>
-    (person.full_name || person.username || "")
-      .toLowerCase()
-      .includes(search.toLowerCase())
-  );
+  function startCall(type: "audio" | "video") {
+    setError(
+      `${type === "audio" ? "Audio" : "Video"} calling is not connected yet. WebRTC and call signaling must be implemented before real calls can work.`
+    );
+  }
+
+  const filteredPeople = people.filter((person) => {
+    const name = person.full_name || person.username || "";
+    return name.toLowerCase().includes(search.toLowerCase());
+  });
+
+  const displayName = (person: Profile) =>
+    person.full_name || person.username || "Imran User";
+
+  const initials = (person: Profile) =>
+    displayName(person).charAt(0).toUpperCase();
 
   if (loading) {
     return (
       <main className="loading">
-        <div className="logo">إ</div>
-        <h2>Loading Imran...</h2>
+        <div className="loading-logo">إ</div>
+        <h2>Imran</h2>
+        <p>Preparing your conversations...</p>
         <style jsx>{`
           .loading {
             min-height: 100vh;
@@ -297,17 +372,23 @@ export default function ChatPage() {
             flex-direction: column;
             justify-content: center;
             align-items: center;
-            background: #061510;
-            color: #35d69a;
-            font-family: Arial;
+            background: #071610;
+            color: white;
+            font-family: Arial, sans-serif;
           }
-          .logo {
-            background: #29d994;
-            color: #061510;
-            padding: 20px;
-            border-radius: 20px;
-            font-size: 35px;
+          .loading-logo {
+            width: 76px;
+            height: 76px;
+            display: grid;
+            place-items: center;
+            border-radius: 24px;
+            background: linear-gradient(135deg, #40edac, #0c9b70);
+            color: #062016;
+            font-size: 38px;
+            font-weight: bold;
           }
+          h2 { color: #40edac; margin-bottom: 0; }
+          p { color: #829d91; }
         `}</style>
       </main>
     );
@@ -315,22 +396,33 @@ export default function ChatPage() {
 
   return (
     <main className="app">
-      <aside className="sidebar">
-        <header className="header">
+      <aside className={`sidebar ${mobileChat ? "mobile-hidden" : ""}`}>
+        <header className="side-header">
           <div className="brand">
-            <div className="logo">إ</div>
+            <div className="brand-logo">إ</div>
             <div>
               <h1>Imran</h1>
-              <small>Messenger</small>
+              <span>Connect with everyone</span>
             </div>
           </div>
-          <button onClick={logout} className="logout">
-            Logout ↪
+          <button className="logout" onClick={logout} disabled={loggingOut}>
+            {loggingOut ? "..." : "↪"}
           </button>
         </header>
 
-        <div className="search">
-          🔎
+        <div className="account">
+          <div className="my-avatar">
+            {myProfile ? initials(myProfile) : "U"}
+          </div>
+          <div className="account-info">
+            <strong>{myProfile?.full_name || myProfile?.username || "My Account"}</strong>
+            <span>{myEmail}</span>
+          </div>
+          <span className="account-status" />
+        </div>
+
+        <div className="search-box">
+          <span>⌕</span>
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -338,120 +430,123 @@ export default function ChatPage() {
           />
         </div>
 
-        <div className="section-title">PEOPLE</div>
+        <div className="list-heading">
+          <span>MESSAGES</span>
+          <span>{filteredPeople.length} PEOPLE</span>
+        </div>
 
-        <div className="people">
+        <div className="people-list">
           {filteredPeople.map((person) => (
             <button
               key={person.id}
-              className={`person ${
-                selected?.id === person.id ? "selected" : ""
-              }`}
+              className={`person ${selected?.id === person.id ? "active" : ""}`}
               onClick={() => openChat(person)}
+              disabled={opening}
             >
-              <div className="avatar">
-                {person.avatar_url ? (
-                  <img src={person.avatar_url} alt="" />
-                ) : (
-                  (person.full_name || person.username || "U")
-                    .charAt(0)
-                    .toUpperCase()
-                )}
-                {person.is_online && <i />}
+              <div className="avatar-wrap">
+                <div className="avatar">
+                  {person.avatar_url ? (
+                    <img src={person.avatar_url} alt="" />
+                  ) : (
+                    initials(person)
+                  )}
+                </div>
+                {person.is_online && <span className="online-dot" />}
               </div>
 
-              <div className="person-info">
-                <strong>
-                  {person.full_name ||
-                    person.username ||
-                    "Imran User"}
-                </strong>
-                <small>
-                  {person.is_online ? "Online" : "Offline"}
-                </small>
+              <div className="person-details">
+                <strong>{displayName(person)}</strong>
+                <span>{person.is_online ? "Online now" : "Offline"}</span>
               </div>
-              <span>›</span>
+
+              <span className="person-arrow">›</span>
             </button>
           ))}
 
           {filteredPeople.length === 0 && (
-            <p className="empty">No people found.</p>
+            <div className="empty-people">
+              <span>👥</span>
+              <p>No people found</p>
+              <small>New registered users will appear here.</small>
+            </div>
           )}
         </div>
 
-        <footer className="my-account">
-          <div className="avatar">U</div>
-          <div>
-            <strong>My Account</strong>
-            <small>{myEmail}</small>
-          </div>
+        <footer className="side-footer">
+          <span className="secure-icon">🔒</span>
+          <span>Private and secure messaging</span>
         </footer>
       </aside>
 
-      <section className="chat-area">
+      <section className={`chat-panel ${!mobileChat ? "mobile-hidden" : ""}`}>
         {selected ? (
           <>
             <header className="chat-header">
+              <button
+                className="back-button"
+                onClick={() => setMobileChat(false)}
+              >
+                ←
+              </button>
+
               <div className="avatar">
-                {(selected.full_name ||
-                  selected.username ||
-                  "U").charAt(0).toUpperCase()}
+                {selected.avatar_url ? (
+                  <img src={selected.avatar_url} alt="" />
+                ) : (
+                  initials(selected)
+                )}
               </div>
-              <div>
-                <strong>
-                  {selected.full_name ||
-                    selected.username ||
-                    "Imran User"}
-                </strong>
-                <small>
-                  {selected.is_online ? "Online" : "Offline"}
-                </small>
+
+              <div className="chat-person">
+                <strong>{displayName(selected)}</strong>
+                <span>{selected.is_online ? "● Online" : "Offline"}</span>
               </div>
-              <div className="call-buttons">
-                <button
-                  title="Audio call"
-                  onClick={() =>
-                    setError("Audio calling will be added in the next stage.")
-                  }
-                >
-                  📞
+
+              <div className="call-actions">
+                <button onClick={() => startCall("audio")} title="Audio call">
+                  ☎
                 </button>
-                <button
-                  title="Video call"
-                  onClick={() =>
-                    setError("Video calling will be added in the next stage.")
-                  }
-                >
-                  📹
+                <button onClick={() => startCall("video")} title="Video call">
+                  ▣
                 </button>
               </div>
             </header>
 
-            <div className="messages">
-              {messages.length === 0 ? (
-                <div className="no-messages">
-                  <span>💬</span>
-                  <h2>Start your conversation</h2>
-                  <p>Send your first message to this person.</p>
+            <div className="conversation">
+              <div className="date-label">PRIVATE CONVERSATION</div>
+
+              {opening ? (
+                <div className="conversation-state">Opening conversation...</div>
+              ) : messages.length === 0 ? (
+                <div className="empty-chat">
+                  <div className="empty-chat-icon">💬</div>
+                  <h2>Start a conversation</h2>
+                  <p>Say hello to {displayName(selected)}.</p>
                 </div>
               ) : (
-                messages.map((item) => (
-                  <div
-                    key={item.id}
-                    className={`message ${
-                      item.sender_id === myId ? "mine" : "theirs"
-                    }`}
-                  >
-                    <p>{item.content}</p>
-                    <small>
-                      {new Date(item.created_at).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })}
-                    </small>
-                  </div>
-                ))
+                messages.map((item) => {
+                  const mine = item.sender_id === myId;
+
+                  return (
+                    <div
+                      key={item.id}
+                      className={`message-row ${mine ? "mine" : "theirs"}`}
+                    >
+                      <div className="bubble">
+                        <p>{item.content}</p>
+                        <span>
+                          {new Date(item.created_at).toLocaleTimeString([], {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                          {mine ? "  ✓" : ""}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })
               )}
+
               <div ref={bottomRef} />
             </div>
 
@@ -460,174 +555,219 @@ export default function ChatPage() {
                 value={message}
                 onChange={(e) => setMessage(e.target.value)}
                 placeholder="Write a message..."
+                disabled={!conversationId || opening}
               />
-              <button disabled={sending || !message.trim()}>
-                {sending ? "..." : "➤"}
+              <button
+                className="send-button"
+                type="submit"
+                disabled={!message.trim() || !conversationId || sending}
+              >
+                {sending ? "…" : "➤"}
               </button>
             </form>
           </>
         ) : (
           <div className="welcome">
-            <div className="big-logo">إ</div>
+            <div className="welcome-logo">إ</div>
+            <span className="welcome-tag">YOUR WORLD. YOUR PEOPLE.</span>
             <h2>Welcome to Imran</h2>
-            <p>Select a person to start a private conversation.</p>
-            <div className="features">
-              <span>💬 Private messages</span>
-              <span>👥 Connect with people</span>
-              <span>📞 Audio calls (coming next)</span>
-              <span>📹 Video calls (coming next)</span>
+            <p>
+              A place to connect, communicate and share.
+              Choose someone from your contacts to begin a private conversation.
+            </p>
+
+            <div className="welcome-features">
+              <div><span>💬</span><strong>Private chat</strong></div>
+              <div><span>⚡</span><strong>Live messaging</strong></div>
+              <div><span>👥</span><strong>People</strong></div>
+              <div><span>📞</span><strong>Calls coming next</strong></div>
             </div>
           </div>
         )}
 
         {error && (
-          <div className="error">
-            {error}
+          <div className="error-message">
+            <span>⚠ {error}</span>
             <button onClick={() => setError("")}>×</button>
           </div>
         )}
       </section>
 
       <style jsx>{`
-        * {
-          box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
 
         .app {
-          min-height: 100vh;
           display: flex;
-          background: #061510;
-          color: white;
+          width: 100%;
+          height: 100dvh;
+          min-height: 550px;
+          overflow: hidden;
+          background: #071610;
+          color: #f1faf5;
           font-family: Arial, sans-serif;
         }
 
+        button { font: inherit; cursor: pointer; }
+
         .sidebar {
-          width: 350px;
-          min-width: 300px;
+          width: 360px;
+          min-width: 310px;
           display: flex;
           flex-direction: column;
-          background: #0b211a;
-          border-right: 1px solid #254b3e;
-          height: 100vh;
+          background: #0b1f18;
+          border-right: 1px solid #1c4032;
         }
 
-        .header {
-          padding: 18px;
+        .side-header {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          border-bottom: 1px solid #254b3e;
+          padding: 19px;
+          border-bottom: 1px solid #1b3b30;
         }
 
-        .brand {
-          display: flex;
-          align-items: center;
-          gap: 12px;
-        }
+        .brand { display: flex; align-items: center; gap: 12px; }
 
-        .logo,
-        .big-logo {
-          display: flex;
-          justify-content: center;
-          align-items: center;
-          background: linear-gradient(135deg, #35e7a0, #0b956a);
-          color: #061510;
+        .brand-logo, .welcome-logo {
+          display: grid;
+          place-items: center;
+          background: linear-gradient(135deg, #47efad, #07986c);
+          color: #052016;
           font-weight: bold;
         }
 
-        .logo {
-          width: 45px;
-          height: 45px;
-          border-radius: 14px;
+        .brand-logo {
+          width: 47px;
+          height: 47px;
+          border-radius: 15px;
           font-size: 25px;
         }
 
-        h1 {
+        .brand h1 {
           margin: 0;
-          color: #35d69a;
+          color: #42e5a4;
           font-size: 23px;
         }
 
-        .brand small,
-        .chat-header small {
+        .brand span {
           display: block;
-          color: #82a497;
           margin-top: 4px;
-        }
-
-        button {
-          cursor: pointer;
+          color: #78998a;
+          font-size: 11px;
         }
 
         .logout {
-          border: 0;
-          border-radius: 8px;
-          background: #183a2e;
-          color: #f19a88;
-          padding: 9px;
-        }
-
-        .search {
-          margin: 16px;
-          padding: 13px;
-          display: flex;
-          gap: 10px;
-          background: #061812;
-          border: 1px solid #294e42;
+          width: 39px;
+          height: 39px;
+          border: 1px solid #315344;
           border-radius: 12px;
+          background: #122e23;
+          color: #f0a18d;
+          font-size: 21px;
         }
 
-        .search input,
-        .composer input {
+        .account {
+          display: flex;
+          align-items: center;
+          gap: 11px;
+          margin: 15px;
+          padding: 12px;
+          border: 1px solid #254a39;
+          border-radius: 14px;
+          background: #10291f;
+        }
+
+        .my-avatar, .avatar {
+          display: grid;
+          place-items: center;
+          flex-shrink: 0;
+          border-radius: 50%;
+          background: linear-gradient(135deg, #286e51, #174332);
+          color: white;
+          font-weight: bold;
+          overflow: hidden;
+        }
+
+        .my-avatar { width: 42px; height: 42px; }
+
+        .account-info, .person-details {
+          display: flex;
+          flex: 1;
+          flex-direction: column;
+          gap: 5px;
+          min-width: 0;
+        }
+
+        .account-info strong, .account-info span {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .account-info strong { font-size: 13px; }
+        .account-info span { color: #78998a; font-size: 10px; }
+
+        .account-status, .online-dot {
+          width: 9px;
+          height: 9px;
+          border-radius: 50%;
+          background: #39e6a1;
+        }
+
+        .search-box {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          margin: 0 15px 16px;
+          padding: 12px 14px;
+          border: 1px solid #244536;
+          border-radius: 12px;
+          background: #071a12;
+          color: #8eb5a2;
+        }
+
+        .search-box span { font-size: 23px; }
+        .search-box input {
           width: 100%;
           border: 0;
           outline: 0;
           background: transparent;
           color: white;
+          font-size: 13px;
         }
 
-        .section-title {
-          padding: 5px 18px 12px;
-          font-size: 11px;
-          color: #6e9586;
+        .list-heading {
+          display: flex;
+          justify-content: space-between;
+          padding: 0 18px 11px;
+          color: #709483;
+          font-size: 10px;
           letter-spacing: 1px;
         }
 
-        .people {
-          flex: 1;
-          overflow-y: auto;
-        }
+        .people-list { flex: 1; overflow-y: auto; }
 
         .person {
           width: 100%;
           display: flex;
           align-items: center;
           gap: 12px;
-          padding: 13px 17px;
-          background: transparent;
+          padding: 12px 17px;
           border: 0;
+          border-left: 3px solid transparent;
+          background: transparent;
           color: white;
           text-align: left;
         }
 
-        .person:hover,
-        .person.selected {
-          background: #153b2e;
+        .person:hover, .person.active {
+          background: #143729;
+          border-left-color: #38d99a;
         }
 
-        .avatar {
-          width: 45px;
-          height: 45px;
-          min-width: 45px;
-          display: flex;
-          justify-content: center;
-          align-items: center;
-          position: relative;
-          border-radius: 50%;
-          background: #1c6249;
-          font-weight: bold;
-          overflow: hidden;
-        }
+        .avatar-wrap { position: relative; }
+
+        .avatar { width: 46px; height: 46px; font-size: 16px; }
 
         .avatar img {
           width: 100%;
@@ -635,311 +775,294 @@ export default function ChatPage() {
           object-fit: cover;
         }
 
-        .avatar i {
+        .online-dot {
           position: absolute;
-          width: 11px;
-          height: 11px;
-          right: 1px;
+          right: 0;
           bottom: 1px;
-          border: 2px solid #0b211a;
-          border-radius: 50%;
-          background: #35e49a;
+          border: 2px solid #0b1f18;
         }
 
-        .person-info {
-          flex: 1;
-          min-width: 0;
-        }
-
-        .person-info strong,
-        .person-info small {
-          display: block;
+        .person-details strong {
+          font-size: 13px;
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
         }
 
-        .person-info small {
-          color: #79a092;
-          margin-top: 5px;
+        .person-details span { color: #80a291; font-size: 11px; }
+        .person-arrow { color: #628474; font-size: 23px; }
+
+        .empty-people {
+          padding: 40px 18px;
+          text-align: center;
+          color: #819f90;
         }
 
-        .empty {
-          padding: 20px;
-          color: #82a497;
-        }
+        .empty-people > span { font-size: 35px; }
+        .empty-people p { margin-bottom: 5px; }
+        .empty-people small { font-size: 11px; }
 
-        .my-account {
+        .side-footer {
           display: flex;
-          gap: 12px;
-          align-items: center;
-          padding: 14px;
-          border-top: 1px solid #254b3e;
-          overflow: hidden;
-        }
-
-        .my-account small {
-          display: block;
-          color: #77988b;
-          overflow: hidden;
-          text-overflow: ellipsis;
-          max-width: 210px;
-          margin-top: 4px;
-        }
-
-        .chat-area {
-          flex: 1;
-          min-width: 0;
-          height: 100vh;
-          display: flex;
-          flex-direction: column;
-          position: relative;
-          background:
-            radial-gradient(circle at center, #103326, #061510 75%);
-        }
-
-        .chat-header {
-          min-height: 75px;
-          padding: 12px 20px;
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          background: #0b211a;
-          border-bottom: 1px solid #254b3e;
-        }
-
-        .call-buttons {
-          margin-left: auto;
-          display: flex;
-          gap: 10px;
-        }
-
-        .call-buttons button {
-          border: 0;
-          border-radius: 10px;
-          padding: 10px;
-          background: #174532;
-          color: #35d69a;
-          font-size: 19px;
-        }
-
-        .messages {
-          flex: 1;
-          overflow-y: auto;
-          padding: 22px;
-          display: flex;
-          flex-direction: column;
-          gap: 12px;
-        }
-
-        .message {
-          max-width: 75%;
-          padding: 11px 14px;
-          border-radius: 14px;
-          overflow-wrap: anywhere;
-        }
-
-        .message p {
-          margin: 0 0 6px;
-          line-height: 1.45;
-        }
-
-        .message small {
-          display: block;
-          text-align: right;
-          color: #a3c5b7;
+          justify-content: center;
+          gap: 8px;
+          padding: 15px;
+          border-top: 1px solid #1b3b30;
+          color: #709483;
           font-size: 10px;
         }
 
-        .mine {
-          align-self: flex-end;
-          background: #126b4b;
-          border-bottom-right-radius: 4px;
+        .chat-panel {
+          position: relative;
+          display: flex;
+          flex: 1;
+          flex-direction: column;
+          min-width: 0;
+          background:
+            radial-gradient(ellipse at center, #102d20 0%, #081911 75%);
         }
 
-        .theirs {
-          align-self: flex-start;
-          background: #19392e;
-          border-bottom-left-radius: 4px;
+        .chat-header {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          min-height: 76px;
+          padding: 12px 20px;
+          border-bottom: 1px solid #214435;
+          background: #0b2118;
+        }
+
+        .chat-person { flex: 1; }
+        .chat-person strong { font-size: 14px; }
+        .chat-person span {
+          display: block;
+          margin-top: 5px;
+          color: #38d99a;
+          font-size: 11px;
+        }
+
+        .call-actions { display: flex; gap: 9px; }
+
+        .call-actions button {
+          width: 42px;
+          height: 42px;
+          border: 1px solid #315a43;
+          border-radius: 12px;
+          background: #153829;
+          color: #48e5a7;
+          font-size: 20px;
+        }
+
+        .call-actions button:hover { background: #20533b; }
+
+        .back-button {
+          display: none;
+          border: 0;
+          background: transparent;
+          color: #4ae4a8;
+          font-size: 24px;
+        }
+
+        .conversation {
+          display: flex;
+          flex: 1;
+          flex-direction: column;
+          gap: 12px;
+          overflow-y: auto;
+          padding: 22px clamp(12px, 5vw, 65px);
+        }
+
+        .date-label {
+          align-self: center;
+          padding: 7px 12px;
+          border: 1px solid #294938;
+          border-radius: 20px;
+          background: #10291d;
+          color: #86a997;
+          font-size: 9px;
+          letter-spacing: 1px;
+        }
+
+        .conversation-state {
+          margin: auto;
+          color: #8ba999;
+        }
+
+        .empty-chat {
+          margin: auto;
+          text-align: center;
+          color: #8ba999;
+        }
+
+        .empty-chat-icon { font-size: 48px; }
+        .empty-chat h2 { color: white; font-size: 21px; }
+        .empty-chat p { font-size: 13px; }
+
+        .message-row { display: flex; width: 100%; }
+        .message-row.mine { justify-content: flex-end; }
+        .message-row.theirs { justify-content: flex-start; }
+
+        .bubble {
+          max-width: min(75%, 500px);
+          padding: 11px 14px 8px;
+          border: 1px solid #28543c;
+          border-radius: 15px;
+          background: #153629;
+          overflow-wrap: anywhere;
+        }
+
+        .mine .bubble {
+          border-color: #167d56;
+          border-bottom-right-radius: 4px;
+          background: linear-gradient(135deg, #126a48, #105b40);
+        }
+
+        .theirs .bubble { border-bottom-left-radius: 4px; }
+
+        .bubble p {
+          margin: 0 0 7px;
+          color: #f2fff7;
+          font-size: 14px;
+          line-height: 1.5;
+          white-space: pre-wrap;
+        }
+
+        .bubble span {
+          display: block;
+          color: #b4d6c3;
+          text-align: right;
+          font-size: 9px;
         }
 
         .composer {
           display: flex;
-          gap: 12px;
-          padding: 15px;
-          background: #0b211a;
-          border-top: 1px solid #254b3e;
+          align-items: center;
+          gap: 10px;
+          padding: 14px 18px;
+          border-top: 1px solid #214435;
+          background: #0b2118;
         }
 
         .composer input {
-          padding: 13px;
-          border-radius: 12px;
-          background: #061812;
+          flex: 1;
+          min-width: 0;
+          padding: 14px 16px;
+          border: 1px solid #294a39;
+          border-radius: 13px;
+          outline: none;
+          background: #071a12;
+          color: white;
+          font-size: 14px;
         }
 
-        .composer button {
+        .composer input:focus { border-color: #35d99a; }
+
+        .send-button {
           width: 48px;
-          min-width: 48px;
+          height: 48px;
           border: 0;
-          border-radius: 12px;
-          background: #2cdb96;
-          color: #061510;
+          border-radius: 14px;
+          background: linear-gradient(135deg, #48e9a8, #14aa76);
+          color: #052016;
           font-size: 22px;
           font-weight: bold;
         }
 
-        .composer button:disabled {
-          opacity: 0.5;
+        .send-button:disabled {
+          cursor: not-allowed;
+          opacity: 0.45;
         }
 
-        .welcome,
-        .no-messages {
+        .welcome {
+          width: min(580px, 90%);
           margin: auto;
-          padding: 25px;
           text-align: center;
-          color: #8eaea1;
         }
 
-        .big-logo {
-          width: 90px;
-          height: 90px;
-          margin: 0 auto 20px;
-          border-radius: 27px;
-          font-size: 45px;
+        .welcome-logo {
+          width: 95px;
+          height: 95px;
+          margin: 0 auto 22px;
+          border-radius: 28px;
+          font-size: 48px;
+          box-shadow: 0 15px 50px #1caa6b25;
         }
 
-        .welcome h2,
-        .no-messages h2 {
-          color: white;
+        .welcome-tag {
+          color: #44dba0;
+          font-size: 10px;
+          letter-spacing: 2px;
         }
 
-        .features {
+        .welcome h2 { margin: 12px 0; font-size: 32px; }
+        .welcome > p {
+          color: #8ba999;
+          font-size: 14px;
+          line-height: 1.8;
+        }
+
+        .welcome-features {
           display: grid;
+          grid-template-columns: repeat(2, 1fr);
           gap: 12px;
-          margin-top: 25px;
+          margin-top: 28px;
         }
 
-        .features span {
-          padding: 12px;
-          border: 1px solid #285442;
-          border-radius: 10px;
-          background: #0b211a;
-        }
-
-        .error {
-          position: absolute;
-          bottom: 85px;
-          left: 15px;
-          right: 15px;
-          padding: 12px;
-          background: #632e2e;
-          border-radius: 10px;
-          color: white;
+        .welcome-features div {
           display: flex;
+          align-items: center;
+          gap: 12px;
+          padding: 16px;
+          border: 1px solid #294a39;
+          border-radius: 13px;
+          background: #10291d;
+          text-align: left;
+        }
+
+        .welcome-features span { font-size: 22px; }
+        .welcome-features strong { font-size: 12px; }
+
+        .error-message {
+          position: absolute;
+          right: 15px;
+          bottom: 82px;
+          left: 15px;
+          z-index: 5;
+          display: flex;
+          align-items: flex-start;
           justify-content: space-between;
-          gap: 10px;
+          gap: 12px;
+          padding: 13px 15px;
+          border: 1px solid #a94d48;
+          border-radius: 12px;
+          background: #542b29;
+          color: #ffe2dd;
+          font-size: 12px;
+          line-height: 1.5;
           overflow-wrap: anywhere;
         }
 
-        .error button {
+        .error-message button {
+          flex-shrink: 0;
           border: 0;
           background: transparent;
           color: white;
-          font-size: 20px;
+          font-size: 21px;
         }
 
         @media (max-width: 700px) {
-          .sidebar {
-            width: 115px;
-            min-width: 115px;
-          }
+          .sidebar { width: 100%; min-width: 0; }
+          .chat-panel { width: 100%; }
+          .mobile-hidden { display: none; }
+          .back-button { display: block; }
+          .chat-header { padding: 10px 12px; }
+          .conversation { padding: 15px 10px; }
+          .composer { padding: 10px; }
+          .welcome h2 { font-size: 25px; }
+        }
 
-          .header {
-            padding: 12px 8px;
-            flex-direction: column;
-            gap: 10px;
-          }
-
-          .brand {
-            flex-direction: column;
-            gap: 4px;
-          }
-
-          .brand h1 {
-            font-size: 17px;
-          }
-
-          .brand small {
-            display: none;
-          }
-
-          .logout {
-            font-size: 10px;
-          }
-
-          .search {
-            margin: 8px;
-            padding: 9px 5px;
-          }
-
-          .search input {
-            min-width: 0;
-            font-size: 10px;
-          }
-
-          .section-title {
-            padding: 8px;
-            font-size: 9px;
-          }
-
-          .person {
-            padding: 12px 5px;
-            flex-direction: column;
-            gap: 5px;
-            text-align: center;
-          }
-
-          .person-info strong {
-            font-size: 10px;
-          }
-
-          .person-info small {
-            font-size: 9px;
-          }
-
-          .person > span {
-            display: none;
-          }
-
-          .my-account {
-            padding: 8px 3px;
-            flex-direction: column;
-            text-align: center;
-          }
-
-          .my-account small {
-            display: none;
-          }
-
-          .my-account strong {
-            font-size: 9px;
-          }
-
-          .chat-header {
-            padding: 10px;
-          }
-
-          .chat-header strong {
-            font-size: 12px;
-          }
-
-          .messages {
-            padding: 12px 8px;
-          }
-
-          .message {
-            max-width: 90%;
-          }
+        @media (min-width: 701px) {
+          .sidebar { max-width: 390px; }
         }
       `}</style>
     </main>
