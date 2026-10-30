@@ -42,11 +42,15 @@ export default function ChatPage() {
   const [error, setError] = useState("");
   const [mobileChat, setMobileChat] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [connected, setConnected] = useState(true);
 
   const getError = (err: any) =>
     err?.message || err?.details || err?.hint || "An unexpected error occurred.";
 
+  // Load all messages from Supabase.
   const loadMessages = useCallback(async (id: string) => {
+    if (!id) return;
+
     const { data, error } = await supabase
       .from("messages")
       .select("id, content, sender_id, created_at, message_type")
@@ -59,6 +63,19 @@ export default function ChatPage() {
     }
 
     setMessages(data || []);
+  }, []);
+
+  // Update online status.
+  const updateOnlineStatus = useCallback(async (online: boolean, userId: string) => {
+    if (!userId) return;
+
+    await supabase
+      .from("profiles")
+      .update({
+        is_online: online,
+        last_seen: new Date().toISOString(),
+      })
+      .eq("id", userId);
   }, []);
 
   // Load authenticated user and people.
@@ -77,24 +94,21 @@ export default function ChatPage() {
         if (!active) return;
 
         const currentUser = data.user;
+
         setMyId(currentUser.id);
         setMyEmail(currentUser.email || "");
 
-        const { data: profile } = await supabase
+        const { data: profile, error: profileError } = await supabase
           .from("profiles")
           .select("id, username, full_name, avatar_url, is_online, last_seen")
           .eq("id", currentUser.id)
           .maybeSingle();
 
+        if (profileError) throw profileError;
+
         if (active && profile) setMyProfile(profile);
 
-        await supabase
-          .from("profiles")
-          .update({
-            is_online: true,
-            last_seen: new Date().toISOString(),
-          })
-          .eq("id", currentUser.id);
+        await updateOnlineStatus(true, currentUser.id);
 
         const { data: users, error: usersError } = await supabase
           .from("profiles")
@@ -129,8 +143,64 @@ export default function ChatPage() {
       active = false;
       subscription.unsubscribe();
     };
-  }, [router]);
+  }, [router, updateOnlineStatus]);
 
+  // Detect internet connection and refresh messages when internet returns.
+  useEffect(() => {
+    const handleOnline = () => {
+      setConnected(true);
+
+      if (myId) updateOnlineStatus(true, myId);
+      if (conversationId) loadMessages(conversationId);
+    };
+
+    const handleOffline = () => {
+      setConnected(false);
+    };
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    setConnected(navigator.onLine);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, [myId, conversationId, loadMessages, updateOnlineStatus]);
+
+  // Refresh when user returns to the app.
+  useEffect(() => {
+    if (!conversationId) return;
+
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible" && navigator.onLine) {
+        loadMessages(conversationId);
+        if (myId) updateOnlineStatus(true, myId);
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibility);
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [conversationId, myId, loadMessages, updateOnlineStatus]);
+
+  // Periodically check for messages missed while offline.
+  useEffect(() => {
+    if (!conversationId) return;
+
+    const interval = window.setInterval(() => {
+      if (navigator.onLine) {
+        loadMessages(conversationId);
+      }
+    }, 15000);
+
+    return () => window.clearInterval(interval);
+  }, [conversationId, loadMessages]);
+
+  // Keep the newest message visible.
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
@@ -147,11 +217,10 @@ export default function ChatPage() {
     setConversationId("");
 
     try {
-      const { data: memberships, error: membershipError } =
-        await supabase
-          .from("conversation_members")
-          .select("conversation_id")
-          .eq("user_id", myId);
+      const { data: memberships, error: membershipError } = await supabase
+        .from("conversation_members")
+        .select("conversation_id")
+        .eq("user_id", myId);
 
       if (membershipError) throw membershipError;
 
@@ -170,11 +239,10 @@ export default function ChatPage() {
         if (conversationError) throw conversationError;
         if (!conversation || conversation.type !== "private") continue;
 
-        const { data: members, error: membersError } =
-          await supabase
-            .from("conversation_members")
-            .select("user_id")
-            .eq("conversation_id", id);
+        const { data: members, error: membersError } = await supabase
+          .from("conversation_members")
+          .select("user_id")
+          .eq("conversation_id", id);
 
         if (membersError) throw membersError;
 
@@ -189,16 +257,15 @@ export default function ChatPage() {
       }
 
       if (!foundId) {
-        const { data: conversation, error: createError } =
-          await supabase
-            .from("conversations")
-            .insert({
-              owner_id: myId,
-              type: "private",
-              name: null,
-            })
-            .select("id")
-            .single();
+        const { data: conversation, error: createError } = await supabase
+          .from("conversations")
+          .insert({
+            owner_id: myId,
+            type: "private",
+            name: null,
+          })
+          .select("id")
+          .single();
 
         if (createError) throw createError;
 
@@ -258,7 +325,12 @@ export default function ChatPage() {
               if (previous.some((m) => m.id === incoming.id)) {
                 return previous;
               }
-              return [...previous, incoming];
+
+              return [...previous, incoming].sort(
+                (a, b) =>
+                  new Date(a.created_at).getTime() -
+                  new Date(b.created_at).getTime()
+              );
             });
           } else {
             loadMessages(conversationId);
@@ -266,8 +338,8 @@ export default function ChatPage() {
         }
       )
       .subscribe((status) => {
-        if (status === "CHANNEL_ERROR") {
-          setError("Realtime connection failed. Check Supabase Realtime settings.");
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          setError("Realtime connection problem. Messages will still refresh from the database.");
         }
       });
 
@@ -279,13 +351,18 @@ export default function ChatPage() {
     };
   }, [conversationId, loadMessages]);
 
-  // Send a text message.
+  // Send a message even if the recipient is offline.
   async function sendMessage(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
 
     const content = message.trim();
 
     if (!content || !conversationId || !myId || sending) return;
+
+    if (!navigator.onLine) {
+      setError("You are offline. Connect to the internet to send this message.");
+      return;
+    }
 
     setSending(true);
     setError("");
@@ -308,7 +385,12 @@ export default function ChatPage() {
 
       setMessages((previous) => {
         if (previous.some((m) => m.id === data.id)) return previous;
-        return [...previous, data];
+
+        return [...previous, data].sort(
+          (a, b) =>
+            new Date(a.created_at).getTime() -
+            new Date(b.created_at).getTime()
+        );
       });
     } catch (err: any) {
       console.error("SEND MESSAGE ERROR:", err);
@@ -325,13 +407,7 @@ export default function ChatPage() {
 
     try {
       if (myId) {
-        await supabase
-          .from("profiles")
-          .update({
-            is_online: false,
-            last_seen: new Date().toISOString(),
-          })
-          .eq("id", myId);
+        await updateOnlineStatus(false, myId);
       }
 
       await supabase.auth.signOut();
@@ -415,10 +491,17 @@ export default function ChatPage() {
             {myProfile ? initials(myProfile) : "U"}
           </div>
           <div className="account-info">
-            <strong>{myProfile?.full_name || myProfile?.username || "My Account"}</strong>
+            <strong>
+              {myProfile?.full_name || myProfile?.username || "My Account"}
+            </strong>
             <span>{myEmail}</span>
           </div>
           <span className="account-status" />
+        </div>
+
+        <div className="connection-status">
+          <span className={connected ? "connection-dot" : "connection-dot offline"} />
+          {connected ? "Internet connected" : "You are offline"}
         </div>
 
         <div className="search-box">
@@ -499,7 +582,7 @@ export default function ChatPage() {
 
               <div className="chat-person">
                 <strong>{displayName(selected)}</strong>
-                <span>{selected.is_online ? "● Online" : "Offline"}</span>
+                <span>{selected.is_online ? "● Online" : "● Offline"}</span>
               </div>
 
               <div className="call-actions">
@@ -516,7 +599,9 @@ export default function ChatPage() {
               <div className="date-label">PRIVATE CONVERSATION</div>
 
               {opening ? (
-                <div className="conversation-state">Opening conversation...</div>
+                <div className="conversation-state">
+                  Opening conversation...
+                </div>
               ) : messages.length === 0 ? (
                 <div className="empty-chat">
                   <div className="empty-chat-icon">💬</div>
@@ -707,12 +792,23 @@ export default function ChatPage() {
         .account-info strong { font-size: 13px; }
         .account-info span { color: #78998a; font-size: 10px; }
 
-        .account-status, .online-dot {
+        .account-status, .online-dot, .connection-dot {
           width: 9px;
           height: 9px;
           border-radius: 50%;
           background: #39e6a1;
         }
+
+        .connection-status {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 0 18px 14px;
+          color: #91b4a2;
+          font-size: 11px;
+        }
+
+        .connection-dot.offline { background: #ef7777; }
 
         .search-box {
           display: flex;
@@ -818,8 +914,7 @@ export default function ChatPage() {
           flex: 1;
           flex-direction: column;
           min-width: 0;
-          background:
-            radial-gradient(ellipse at center, #102d20 0%, #081911 75%);
+          background: radial-gradient(ellipse at center, #102d20 0%, #081911 75%);
         }
 
         .chat-header {
