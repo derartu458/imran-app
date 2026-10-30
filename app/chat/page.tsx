@@ -1,7 +1,13 @@
 
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "../../lib/supabase/client";
 
@@ -26,6 +32,7 @@ export default function ChatPage() {
   const router = useRouter();
   const bottomRef = useRef<HTMLDivElement>(null);
   const channelRef = useRef<any>(null);
+  const openingRef = useRef(false);
 
   const [myId, setMyId] = useState("");
   const [myEmail, setMyEmail] = useState("");
@@ -45,9 +52,9 @@ export default function ChatPage() {
   const [connected, setConnected] = useState(true);
 
   const getError = (err: any) =>
-    err?.message || err?.details || err?.hint || "An unexpected error occurred.";
+    err?.message || err?.details || "An unexpected error occurred.";
 
-  // Load all messages from Supabase.
+  // Load messages saved in Supabase.
   const loadMessages = useCallback(async (id: string) => {
     if (!id) return;
 
@@ -65,20 +72,25 @@ export default function ChatPage() {
     setMessages(data || []);
   }, []);
 
-  // Update online status.
-  const updateOnlineStatus = useCallback(async (online: boolean, userId: string) => {
-    if (!userId) return;
+  // Update this user's online status.
+  const updateOnlineStatus = useCallback(
+    async (online: boolean, userId: string) => {
+      if (!userId || !navigator.onLine) return;
 
-    await supabase
-      .from("profiles")
-      .update({
-        is_online: online,
-        last_seen: new Date().toISOString(),
-      })
-      .eq("id", userId);
-  }, []);
+      const { error } = await supabase
+        .from("profiles")
+        .update({
+          is_online: online,
+          last_seen: new Date().toISOString(),
+        })
+        .eq("id", userId);
 
-  // Load authenticated user and people.
+      if (error) console.error("ONLINE STATUS:", error.message);
+    },
+    []
+  );
+
+  // Initialize authenticated user and contacts.
   useEffect(() => {
     let active = true;
 
@@ -93,39 +105,35 @@ export default function ChatPage() {
 
         if (!active) return;
 
-        const currentUser = data.user;
+        const user = data.user;
 
-        setMyId(currentUser.id);
-        setMyEmail(currentUser.email || "");
+        setMyId(user.id);
+        setMyEmail(user.email || "");
 
         const { data: profile, error: profileError } = await supabase
           .from("profiles")
           .select("id, username, full_name, avatar_url, is_online, last_seen")
-          .eq("id", currentUser.id)
+          .eq("id", user.id)
           .maybeSingle();
 
         if (profileError) throw profileError;
 
         if (active && profile) setMyProfile(profile);
 
-        await updateOnlineStatus(true, currentUser.id);
+        await updateOnlineStatus(true, user.id);
 
         const { data: users, error: usersError } = await supabase
           .from("profiles")
           .select("id, username, full_name, avatar_url, is_online, last_seen")
-          .neq("id", currentUser.id)
+          .neq("id", user.id)
           .order("full_name", { ascending: true })
           .limit(100);
 
-        if (!active) return;
+        if (usersError) throw usersError;
 
-        if (usersError) {
-          setError("Could not load people: " + getError(usersError));
-        } else {
-          setPeople(users || []);
-        }
-      } catch (err) {
-        if (active) setError(getError(err));
+        if (active) setPeople(users || []);
+      } catch (err: any) {
+        if (active) setError("Initialization failed: " + getError(err));
       } finally {
         if (active) setLoading(false);
       }
@@ -145,23 +153,20 @@ export default function ChatPage() {
     };
   }, [router, updateOnlineStatus]);
 
-  // Detect internet connection and refresh messages when internet returns.
+  // Internet connection detection.
   useEffect(() => {
     const handleOnline = () => {
       setConnected(true);
-
       if (myId) updateOnlineStatus(true, myId);
       if (conversationId) loadMessages(conversationId);
     };
 
-    const handleOffline = () => {
-      setConnected(false);
-    };
+    const handleOffline = () => setConnected(false);
+
+    setConnected(navigator.onLine);
 
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
-
-    setConnected(navigator.onLine);
 
     return () => {
       window.removeEventListener("online", handleOnline);
@@ -169,46 +174,42 @@ export default function ChatPage() {
     };
   }, [myId, conversationId, loadMessages, updateOnlineStatus]);
 
-  // Refresh when user returns to the app.
+  // Refresh messages when the app becomes visible again.
   useEffect(() => {
     if (!conversationId) return;
 
-    const handleVisibility = () => {
+    const refresh = () => {
       if (document.visibilityState === "visible" && navigator.onLine) {
         loadMessages(conversationId);
-        if (myId) updateOnlineStatus(true, myId);
+        updateOnlineStatus(true, myId);
       }
     };
 
-    document.addEventListener("visibilitychange", handleVisibility);
+    document.addEventListener("visibilitychange", refresh);
 
-    return () => {
-      document.removeEventListener("visibilitychange", handleVisibility);
-    };
+    return () => document.removeEventListener("visibilitychange", refresh);
   }, [conversationId, myId, loadMessages, updateOnlineStatus]);
 
-  // Periodically check for messages missed while offline.
+  // Poll for messages in case realtime is unavailable.
   useEffect(() => {
     if (!conversationId) return;
 
-    const interval = window.setInterval(() => {
-      if (navigator.onLine) {
-        loadMessages(conversationId);
-      }
+    const timer = window.setInterval(() => {
+      if (navigator.onLine) loadMessages(conversationId);
     }, 15000);
 
-    return () => window.clearInterval(interval);
+    return () => window.clearInterval(timer);
   }, [conversationId, loadMessages]);
 
-  // Keep the newest message visible.
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
   // Find an existing private conversation or create one.
   async function openChat(person: Profile) {
-    if (!myId || opening) return;
+    if (!myId || openingRef.current) return;
 
+    openingRef.current = true;
     setOpening(true);
     setError("");
     setSelected(person);
@@ -217,6 +218,11 @@ export default function ChatPage() {
     setConversationId("");
 
     try {
+      if (!navigator.onLine) {
+        throw new Error("Connect to the internet before opening a chat.");
+      }
+
+      // Get conversations where the current user is a member.
       const { data: memberships, error: membershipError } = await supabase
         .from("conversation_members")
         .select("conversation_id")
@@ -226,18 +232,9 @@ export default function ChatPage() {
 
       let foundId = "";
 
+      // Check whether a private chat with this person already exists.
       for (const membership of memberships || []) {
         const id = membership.conversation_id;
-
-        const { data: conversation, error: conversationError } =
-          await supabase
-            .from("conversations")
-            .select("id, type")
-            .eq("id", id)
-            .maybeSingle();
-
-        if (conversationError) throw conversationError;
-        if (!conversation || conversation.type !== "private") continue;
 
         const { data: members, error: membersError } = await supabase
           .from("conversation_members")
@@ -246,20 +243,35 @@ export default function ChatPage() {
 
         if (membersError) throw membersError;
 
-        const isTwoPersonChat =
-          (members || []).some((m) => m.user_id === person.id) &&
-          (members || []).some((m) => m.user_id === myId);
+        const memberIds = (members || []).map((m) => m.user_id);
 
-        if (isTwoPersonChat && (members || []).length === 2) {
-          foundId = id;
-          break;
+        if (
+          memberIds.length === 2 &&
+          memberIds.includes(myId) &&
+          memberIds.includes(person.id)
+        ) {
+          const { data: conversation, error: conversationError } =
+            await supabase
+              .from("conversations")
+              .select("id, type")
+              .eq("id", id)
+              .maybeSingle();
+
+          if (conversationError) throw conversationError;
+
+          if (conversation?.type === "private") {
+            foundId = id;
+            break;
+          }
         }
       }
 
+      // Create a new private conversation if one does not exist.
       if (!foundId) {
         const { data: conversation, error: createError } = await supabase
           .from("conversations")
           .insert({
+            created_by: myId,
             owner_id: myId,
             type: "private",
             name: null,
@@ -271,6 +283,7 @@ export default function ChatPage() {
 
         foundId = conversation.id;
 
+        // Add both participants.
         const { error: addMembersError } = await supabase
           .from("conversation_members")
           .insert([
@@ -286,7 +299,10 @@ export default function ChatPage() {
             },
           ]);
 
-        if (addMembersError) throw addMembersError;
+        if (addMembersError) {
+          console.error("ADD MEMBERS:", addMembersError);
+          throw addMembersError;
+        }
       }
 
       setConversationId(foundId);
@@ -295,11 +311,12 @@ export default function ChatPage() {
       console.error("OPEN CHAT ERROR:", err);
       setError("Could not open chat: " + getError(err));
     } finally {
+      openingRef.current = false;
       setOpening(false);
     }
   }
 
-  // Realtime updates for the selected conversation.
+  // Realtime messages.
   useEffect(() => {
     if (!conversationId) return;
 
@@ -308,7 +325,7 @@ export default function ChatPage() {
     }
 
     const channel = supabase
-      .channel("imran-messages-" + conversationId)
+      .channel("imran-chat-" + conversationId)
       .on(
         "postgres_changes",
         {
@@ -339,7 +356,7 @@ export default function ChatPage() {
       )
       .subscribe((status) => {
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          setError("Realtime connection problem. Messages will still refresh from the database.");
+          console.warn("Realtime unavailable. Database refresh remains active.");
         }
       });
 
@@ -351,8 +368,8 @@ export default function ChatPage() {
     };
   }, [conversationId, loadMessages]);
 
-  // Send a message even if the recipient is offline.
-  async function sendMessage(e: React.FormEvent<HTMLFormElement>) {
+  // Send and save a message.
+  async function sendMessage(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
 
     const content = message.trim();
@@ -360,7 +377,7 @@ export default function ChatPage() {
     if (!content || !conversationId || !myId || sending) return;
 
     if (!navigator.onLine) {
-      setError("You are offline. Connect to the internet to send this message.");
+      setError("You are offline. Connect to the internet to send messages.");
       return;
     }
 
@@ -385,15 +402,9 @@ export default function ChatPage() {
 
       setMessages((previous) => {
         if (previous.some((m) => m.id === data.id)) return previous;
-
-        return [...previous, data].sort(
-          (a, b) =>
-            new Date(a.created_at).getTime() -
-            new Date(b.created_at).getTime()
-        );
+        return [...previous, data];
       });
     } catch (err: any) {
-      console.error("SEND MESSAGE ERROR:", err);
       setError("Message not sent: " + getError(err));
     } finally {
       setSending(false);
@@ -406,65 +417,63 @@ export default function ChatPage() {
     setLoggingOut(true);
 
     try {
-      if (myId) {
-        await updateOnlineStatus(false, myId);
-      }
-
+      await updateOnlineStatus(false, myId);
       await supabase.auth.signOut();
       router.replace("/");
-    } catch (err) {
+    } catch (err: any) {
       setError(getError(err));
       setLoggingOut(false);
     }
   }
 
+  function displayName(person: Profile) {
+    return person.full_name || person.username || "Imran User";
+  }
+
+  function initials(person: Profile) {
+    return displayName(person).charAt(0).toUpperCase();
+  }
+
   function startCall(type: "audio" | "video") {
     setError(
-      `${type === "audio" ? "Audio" : "Video"} calling is not connected yet. WebRTC and call signaling must be implemented before real calls can work.`
+      `${type === "audio" ? "Audio" : "Video"} calling needs WebRTC and call signaling. This feature is not implemented yet.`
     );
   }
 
   const filteredPeople = people.filter((person) => {
-    const name = person.full_name || person.username || "";
-    return name.toLowerCase().includes(search.toLowerCase());
+    const name = displayName(person).toLowerCase();
+    return name.includes(search.toLowerCase());
   });
-
-  const displayName = (person: Profile) =>
-    person.full_name || person.username || "Imran User";
-
-  const initials = (person: Profile) =>
-    displayName(person).charAt(0).toUpperCase();
 
   if (loading) {
     return (
       <main className="loading">
-        <div className="loading-logo">إ</div>
-        <h2>Imran</h2>
+        <div className="logo">إ</div>
+        <h1>Imran</h1>
         <p>Preparing your conversations...</p>
         <style jsx>{`
           .loading {
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            background: #071610;
+            min-height: 100dvh;
+            display: grid;
+            place-content: center;
+            justify-items: center;
+            background: #071711;
             color: white;
             font-family: Arial, sans-serif;
           }
-          .loading-logo {
-            width: 76px;
-            height: 76px;
+          .logo {
             display: grid;
             place-items: center;
-            border-radius: 24px;
-            background: linear-gradient(135deg, #40edac, #0c9b70);
-            color: #062016;
+            width: 76px;
+            height: 76px;
+            border-radius: 25px;
+            background: linear-gradient(135deg, #55edb0, #08a875);
+            color: #052116;
             font-size: 38px;
             font-weight: bold;
           }
-          h2 { color: #40edac; margin-bottom: 0; }
-          p { color: #829d91; }
+          h1 { color: #55edb0; margin-bottom: 0; }
+          p { color: #91aa9d; }
         `}</style>
       </main>
     );
@@ -472,22 +481,27 @@ export default function ChatPage() {
 
   return (
     <main className="app">
-      <aside className={`sidebar ${mobileChat ? "mobile-hidden" : ""}`}>
+      <aside className={`sidebar ${mobileChat ? "hide-mobile" : ""}`}>
         <header className="side-header">
           <div className="brand">
             <div className="brand-logo">إ</div>
             <div>
               <h1>Imran</h1>
-              <span>Connect with everyone</span>
+              <span>Messages that connect us</span>
             </div>
           </div>
-          <button className="logout" onClick={logout} disabled={loggingOut}>
-            {loggingOut ? "..." : "↪"}
+          <button
+            className="icon-button logout"
+            onClick={logout}
+            disabled={loggingOut}
+            title="Logout"
+          >
+            {loggingOut ? "…" : "↪"}
           </button>
         </header>
 
-        <div className="account">
-          <div className="my-avatar">
+        <div className="my-account">
+          <div className="avatar my-avatar">
             {myProfile ? initials(myProfile) : "U"}
           </div>
           <div className="account-info">
@@ -496,15 +510,15 @@ export default function ChatPage() {
             </strong>
             <span>{myEmail}</span>
           </div>
-          <span className="account-status" />
+          <span className="online-indicator" />
         </div>
 
-        <div className="connection-status">
-          <span className={connected ? "connection-dot" : "connection-dot offline"} />
-          {connected ? "Internet connected" : "You are offline"}
+        <div className="connection">
+          <span className={connected ? "status-dot" : "status-dot offline"} />
+          {connected ? "Connected" : "Offline"}
         </div>
 
-        <div className="search-box">
+        <div className="search">
           <span>⌕</span>
           <input
             value={search}
@@ -513,16 +527,18 @@ export default function ChatPage() {
           />
         </div>
 
-        <div className="list-heading">
-          <span>MESSAGES</span>
-          <span>{filteredPeople.length} PEOPLE</span>
+        <div className="section-heading">
+          <span>CONTACTS</span>
+          <span>{filteredPeople.length}</span>
         </div>
 
         <div className="people-list">
           {filteredPeople.map((person) => (
             <button
               key={person.id}
-              className={`person ${selected?.id === person.id ? "active" : ""}`}
+              className={`person ${
+                selected?.id === person.id ? "active" : ""
+              }`}
               onClick={() => openChat(person)}
               disabled={opening}
             >
@@ -534,34 +550,34 @@ export default function ChatPage() {
                     initials(person)
                   )}
                 </div>
-                {person.is_online && <span className="online-dot" />}
+                {person.is_online && <span className="online-indicator" />}
               </div>
 
-              <div className="person-details">
+              <div className="person-info">
                 <strong>{displayName(person)}</strong>
-                <span>{person.is_online ? "Online now" : "Offline"}</span>
+                <span>{person.is_online ? "Online" : "Offline"}</span>
               </div>
 
-              <span className="person-arrow">›</span>
+              <span className="arrow">›</span>
             </button>
           ))}
 
           {filteredPeople.length === 0 && (
             <div className="empty-people">
               <span>👥</span>
-              <p>No people found</p>
-              <small>New registered users will appear here.</small>
+              <strong>No contacts found</strong>
+              <p>Other registered users will appear here.</p>
             </div>
           )}
         </div>
 
         <footer className="side-footer">
-          <span className="secure-icon">🔒</span>
-          <span>Private and secure messaging</span>
+          <span>🔒</span>
+          Private messaging
         </footer>
       </aside>
 
-      <section className={`chat-panel ${!mobileChat ? "mobile-hidden" : ""}`}>
+      <section className={`chat-panel ${!mobileChat ? "hide-mobile" : ""}`}>
         {selected ? (
           <>
             <header className="chat-header">
@@ -580,9 +596,11 @@ export default function ChatPage() {
                 )}
               </div>
 
-              <div className="chat-person">
+              <div className="chat-user">
                 <strong>{displayName(selected)}</strong>
-                <span>{selected.is_online ? "● Online" : "● Offline"}</span>
+                <span>
+                  {selected.is_online ? "● Online" : "● Offline"}
+                </span>
               </div>
 
               <div className="call-actions">
@@ -596,17 +614,15 @@ export default function ChatPage() {
             </header>
 
             <div className="conversation">
-              <div className="date-label">PRIVATE CONVERSATION</div>
+              <div className="date-label">PRIVATE CHAT</div>
 
               {opening ? (
-                <div className="conversation-state">
-                  Opening conversation...
-                </div>
+                <div className="state">Opening conversation...</div>
               ) : messages.length === 0 ? (
                 <div className="empty-chat">
-                  <div className="empty-chat-icon">💬</div>
+                  <div>💬</div>
                   <h2>Start a conversation</h2>
-                  <p>Say hello to {displayName(selected)}.</p>
+                  <p>Send your first message to {displayName(selected)}.</p>
                 </div>
               ) : (
                 messages.map((item) => {
@@ -643,8 +659,8 @@ export default function ChatPage() {
                 disabled={!conversationId || opening}
               />
               <button
-                className="send-button"
                 type="submit"
+                className="send-button"
                 disabled={!message.trim() || !conversationId || sending}
               >
                 {sending ? "…" : "➤"}
@@ -654,24 +670,24 @@ export default function ChatPage() {
         ) : (
           <div className="welcome">
             <div className="welcome-logo">إ</div>
-            <span className="welcome-tag">YOUR WORLD. YOUR PEOPLE.</span>
+            <span className="eyebrow">YOUR WORLD. YOUR PEOPLE.</span>
             <h2>Welcome to Imran</h2>
             <p>
-              A place to connect, communicate and share.
-              Choose someone from your contacts to begin a private conversation.
+              Connect with your people, share ideas and keep every
+              conversation close. Select a contact to start chatting.
             </p>
 
-            <div className="welcome-features">
-              <div><span>💬</span><strong>Private chat</strong></div>
-              <div><span>⚡</span><strong>Live messaging</strong></div>
-              <div><span>👥</span><strong>People</strong></div>
-              <div><span>📞</span><strong>Calls coming next</strong></div>
+            <div className="features">
+              <div><span>💬</span><strong>Private chats</strong></div>
+              <div><span>⚡</span><strong>Live messages</strong></div>
+              <div><span>👥</span><strong>Your contacts</strong></div>
+              <div><span>📞</span><strong>Calls coming soon</strong></div>
             </div>
           </div>
         )}
 
         {error && (
-          <div className="error-message">
+          <div className="error-banner">
             <span>⚠ {error}</span>
             <button onClick={() => setError("")}>×</button>
           </div>
@@ -685,97 +701,99 @@ export default function ChatPage() {
           display: flex;
           width: 100%;
           height: 100dvh;
-          min-height: 550px;
+          min-height: 500px;
           overflow: hidden;
-          background: #071610;
-          color: #f1faf5;
+          background: #071711;
+          color: #f3fff8;
           font-family: Arial, sans-serif;
         }
 
         button { font: inherit; cursor: pointer; }
 
         .sidebar {
-          width: 360px;
-          min-width: 310px;
+          width: 350px;
+          min-width: 300px;
           display: flex;
           flex-direction: column;
-          background: #0b1f18;
-          border-right: 1px solid #1c4032;
+          background: #0b2018;
+          border-right: 1px solid #1d4031;
         }
 
         .side-header {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          padding: 19px;
-          border-bottom: 1px solid #1b3b30;
+          padding: 18px;
+          border-bottom: 1px solid #1d4031;
         }
 
         .brand { display: flex; align-items: center; gap: 12px; }
-
         .brand-logo, .welcome-logo {
           display: grid;
           place-items: center;
-          background: linear-gradient(135deg, #47efad, #07986c);
-          color: #052016;
+          background: linear-gradient(135deg, #55edb0, #08a875);
+          color: #052116;
           font-weight: bold;
         }
 
         .brand-logo {
-          width: 47px;
-          height: 47px;
+          width: 46px;
+          height: 46px;
           border-radius: 15px;
           font-size: 25px;
         }
 
-        .brand h1 {
-          margin: 0;
-          color: #42e5a4;
-          font-size: 23px;
-        }
-
+        .brand h1 { margin: 0; color: #55edb0; font-size: 23px; }
         .brand span {
           display: block;
           margin-top: 4px;
-          color: #78998a;
+          color: #829e90;
           font-size: 11px;
         }
 
-        .logout {
-          width: 39px;
-          height: 39px;
-          border: 1px solid #315344;
+        .icon-button {
+          width: 40px;
+          height: 40px;
+          border: 1px solid #315744;
           border-radius: 12px;
-          background: #122e23;
-          color: #f0a18d;
+          background: #122e22;
+          color: #f2a28c;
           font-size: 21px;
         }
 
-        .account {
+        .my-account {
           display: flex;
           align-items: center;
           gap: 11px;
           margin: 15px;
           padding: 12px;
-          border: 1px solid #254a39;
-          border-radius: 14px;
-          background: #10291f;
+          border: 1px solid #254b38;
+          border-radius: 15px;
+          background: #102a1e;
         }
 
-        .my-avatar, .avatar {
+        .avatar {
           display: grid;
           place-items: center;
           flex-shrink: 0;
+          width: 46px;
+          height: 46px;
+          overflow: hidden;
           border-radius: 50%;
-          background: linear-gradient(135deg, #286e51, #174332);
+          background: linear-gradient(135deg, #327c58, #17432f);
           color: white;
           font-weight: bold;
-          overflow: hidden;
         }
 
-        .my-avatar { width: 42px; height: 42px; }
+        .avatar img {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        }
 
-        .account-info, .person-details {
+        .my-avatar { width: 43px; height: 43px; }
+
+        .account-info, .person-info {
           display: flex;
           flex: 1;
           flex-direction: column;
@@ -789,17 +807,18 @@ export default function ChatPage() {
           white-space: nowrap;
         }
 
-        .account-info strong { font-size: 13px; }
-        .account-info span { color: #78998a; font-size: 10px; }
+        .account-info strong, .person-info strong { font-size: 13px; }
+        .account-info span { color: #829e90; font-size: 10px; }
 
-        .account-status, .online-dot, .connection-dot {
+        .online-indicator, .status-dot {
           width: 9px;
           height: 9px;
+          flex-shrink: 0;
           border-radius: 50%;
-          background: #39e6a1;
+          background: #43e5a1;
         }
 
-        .connection-status {
+        .connection {
           display: flex;
           align-items: center;
           gap: 8px;
@@ -808,22 +827,22 @@ export default function ChatPage() {
           font-size: 11px;
         }
 
-        .connection-dot.offline { background: #ef7777; }
+        .status-dot.offline { background: #e87979; }
 
-        .search-box {
+        .search {
           display: flex;
           align-items: center;
           gap: 10px;
           margin: 0 15px 16px;
-          padding: 12px 14px;
-          border: 1px solid #244536;
+          padding: 11px 14px;
+          border: 1px solid #284b39;
           border-radius: 12px;
           background: #071a12;
-          color: #8eb5a2;
+          color: #91b4a2;
         }
 
-        .search-box span { font-size: 23px; }
-        .search-box input {
+        .search span { font-size: 23px; }
+        .search input {
           width: 100%;
           border: 0;
           outline: 0;
@@ -832,11 +851,11 @@ export default function ChatPage() {
           font-size: 13px;
         }
 
-        .list-heading {
+        .section-heading {
           display: flex;
           justify-content: space-between;
           padding: 0 18px 11px;
-          color: #709483;
+          color: #779887;
           font-size: 10px;
           letter-spacing: 1px;
         }
@@ -844,10 +863,10 @@ export default function ChatPage() {
         .people-list { flex: 1; overflow-y: auto; }
 
         .person {
-          width: 100%;
           display: flex;
           align-items: center;
           gap: 12px;
+          width: 100%;
           padding: 12px 17px;
           border: 0;
           border-left: 3px solid transparent;
@@ -857,54 +876,42 @@ export default function ChatPage() {
         }
 
         .person:hover, .person.active {
-          background: #143729;
-          border-left-color: #38d99a;
+          background: #153a29;
+          border-left-color: #4be4a7;
         }
 
+        .person:disabled { opacity: .6; }
         .avatar-wrap { position: relative; }
 
-        .avatar { width: 46px; height: 46px; font-size: 16px; }
-
-        .avatar img {
-          width: 100%;
-          height: 100%;
-          object-fit: cover;
-        }
-
-        .online-dot {
+        .avatar-wrap .online-indicator {
           position: absolute;
           right: 0;
           bottom: 1px;
-          border: 2px solid #0b1f18;
+          border: 2px solid #0b2018;
         }
 
-        .person-details strong {
-          font-size: 13px;
-          overflow: hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-        }
-
-        .person-details span { color: #80a291; font-size: 11px; }
-        .person-arrow { color: #628474; font-size: 23px; }
+        .person-info span { color: #85a494; font-size: 11px; }
+        .arrow { color: #739484; font-size: 23px; }
 
         .empty-people {
-          padding: 40px 18px;
+          display: grid;
+          justify-items: center;
+          gap: 9px;
+          padding: 40px 15px;
+          color: #91aa9d;
           text-align: center;
-          color: #819f90;
         }
 
-        .empty-people > span { font-size: 35px; }
-        .empty-people p { margin-bottom: 5px; }
-        .empty-people small { font-size: 11px; }
+        .empty-people span { font-size: 35px; }
+        .empty-people p { margin: 0; font-size: 11px; }
 
         .side-footer {
           display: flex;
           justify-content: center;
           gap: 8px;
           padding: 15px;
-          border-top: 1px solid #1b3b30;
-          color: #709483;
+          border-top: 1px solid #1d4031;
+          color: #789989;
           font-size: 10px;
         }
 
@@ -914,7 +921,7 @@ export default function ChatPage() {
           flex: 1;
           flex-direction: column;
           min-width: 0;
-          background: radial-gradient(ellipse at center, #102d20 0%, #081911 75%);
+          background: radial-gradient(ellipse at center, #102e20, #081911 75%);
         }
 
         .chat-header {
@@ -923,39 +930,36 @@ export default function ChatPage() {
           gap: 12px;
           min-height: 76px;
           padding: 12px 20px;
-          border-bottom: 1px solid #214435;
+          border-bottom: 1px solid #234735;
           background: #0b2118;
         }
 
-        .chat-person { flex: 1; }
-        .chat-person strong { font-size: 14px; }
-        .chat-person span {
+        .chat-user { flex: 1; }
+        .chat-user strong { font-size: 14px; }
+        .chat-user span {
           display: block;
           margin-top: 5px;
-          color: #38d99a;
+          color: #43e5a1;
           font-size: 11px;
         }
 
         .call-actions { display: flex; gap: 9px; }
-
         .call-actions button {
           width: 42px;
           height: 42px;
           border: 1px solid #315a43;
           border-radius: 12px;
           background: #153829;
-          color: #48e5a7;
+          color: #55edb0;
           font-size: 20px;
         }
-
-        .call-actions button:hover { background: #20533b; }
 
         .back-button {
           display: none;
           border: 0;
           background: transparent;
-          color: #4ae4a8;
-          font-size: 24px;
+          color: #55edb0;
+          font-size: 25px;
         }
 
         .conversation {
@@ -978,18 +982,10 @@ export default function ChatPage() {
           letter-spacing: 1px;
         }
 
-        .conversation-state {
-          margin: auto;
-          color: #8ba999;
-        }
-
-        .empty-chat {
-          margin: auto;
-          text-align: center;
-          color: #8ba999;
-        }
-
-        .empty-chat-icon { font-size: 48px; }
+        .state, .empty-chat { margin: auto; text-align: center; }
+        .state { color: #8ba999; }
+        .empty-chat { color: #8ba999; }
+        .empty-chat > div { font-size: 48px; }
         .empty-chat h2 { color: white; font-size: 21px; }
         .empty-chat p { font-size: 13px; }
 
@@ -1057,16 +1053,13 @@ export default function ChatPage() {
           height: 48px;
           border: 0;
           border-radius: 14px;
-          background: linear-gradient(135deg, #48e9a8, #14aa76);
+          background: linear-gradient(135deg, #55edb0, #14aa76);
           color: #052016;
           font-size: 22px;
           font-weight: bold;
         }
 
-        .send-button:disabled {
-          cursor: not-allowed;
-          opacity: 0.45;
-        }
+        .send-button:disabled { opacity: .45; cursor: not-allowed; }
 
         .welcome {
           width: min(580px, 90%);
@@ -1083,7 +1076,7 @@ export default function ChatPage() {
           box-shadow: 0 15px 50px #1caa6b25;
         }
 
-        .welcome-tag {
+        .eyebrow {
           color: #44dba0;
           font-size: 10px;
           letter-spacing: 2px;
@@ -1096,14 +1089,14 @@ export default function ChatPage() {
           line-height: 1.8;
         }
 
-        .welcome-features {
+        .features {
           display: grid;
           grid-template-columns: repeat(2, 1fr);
           gap: 12px;
           margin-top: 28px;
         }
 
-        .welcome-features div {
+        .features div {
           display: flex;
           align-items: center;
           gap: 12px;
@@ -1114,10 +1107,10 @@ export default function ChatPage() {
           text-align: left;
         }
 
-        .welcome-features span { font-size: 22px; }
-        .welcome-features strong { font-size: 12px; }
+        .features span { font-size: 22px; }
+        .features strong { font-size: 12px; }
 
-        .error-message {
+        .error-banner {
           position: absolute;
           right: 15px;
           bottom: 82px;
@@ -1137,7 +1130,7 @@ export default function ChatPage() {
           overflow-wrap: anywhere;
         }
 
-        .error-message button {
+        .error-banner button {
           flex-shrink: 0;
           border: 0;
           background: transparent;
@@ -1148,7 +1141,7 @@ export default function ChatPage() {
         @media (max-width: 700px) {
           .sidebar { width: 100%; min-width: 0; }
           .chat-panel { width: 100%; }
-          .mobile-hidden { display: none; }
+          .hide-mobile { display: none; }
           .back-button { display: block; }
           .chat-header { padding: 10px 12px; }
           .conversation { padding: 15px 10px; }
