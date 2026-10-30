@@ -1,18 +1,29 @@
-
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { supabase } from "../lib/supabase/client";
 
 export default function Home() {
+  const router = useRouter();
+
   const [isLogin, setIsLogin] = useState(true);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
 
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      if (data.session) {
+        router.replace("/chat");
+      }
+    });
+  }, [router]);
+
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
+
     setLoading(true);
     setMessage("");
 
@@ -22,19 +33,26 @@ export default function Home() {
           email,
           password,
         });
+
         if (error) throw error;
-        setMessage("Login successful!");
+
+        router.replace("/chat");
       } else {
         const { error } = await supabase.auth.signUp({
           email,
           password,
         });
+
         if (error) throw error;
-        setMessage("Registration successful! Check your email to confirm your account.");
+
+        setMessage("Registration successful! You can now login.");
+        setIsLogin(true);
       }
     } catch (error) {
       setMessage(
-        error instanceof Error ? error.message : "Something went wrong."
+        error instanceof Error
+          ? error.message
+          : "Something went wrong."
       );
     } finally {
       setLoading(false);
@@ -42,41 +60,56 @@ export default function Home() {
   }
 
   return (
-    <main style={{
-      minHeight: "100vh",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      background: "#071b16",
-      color: "white",
-      padding: "20px",
-      fontFamily: "Arial, sans-serif"
-    }}>
-      <section style={{
-        width: "100%",
-        maxWidth: "400px",
-        background: "#102a22",
-        padding: "30px",
-        borderRadius: "20px",
-        boxShadow: "0 10px 40px #0005"
-      }}>
-        <h1 style={{
-          textAlign: "center",
-          fontSize: "38px",
-          color: "#35d69a",
-          marginBottom: "8px"
-        }}>Imran</h1>
+    <main
+      style={{
+        minHeight: "100vh",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: "#071b16",
+        color: "white",
+        padding: "20px",
+        fontFamily: "Arial, sans-serif",
+      }}
+    >
+      <section
+        style={{
+          width: "100%",
+          maxWidth: "400px",
+          background: "#102a22",
+          padding: "30px",
+          borderRadius: "20px",
+          boxShadow: "0 10px 40px #0005",
+        }}
+      >
+        <h1
+          style={{
+            textAlign: "center",
+            fontSize: "42px",
+            color: "#35d69a",
+            marginBottom: "5px",
+          }}
+        >
+          Imran
+        </h1>
 
-        <p style={{ textAlign: "center", color: "#b8cfc5" }}>
+        <p
+          style={{
+            textAlign: "center",
+            color: "#b8cfc5",
+            marginBottom: "30px",
+          }}
+        >
           Connect. Chat. Share.
         </p>
 
-        <h2 style={{ textAlign: "center", marginTop: "30px" }}>
+        <h2 style={{ textAlign: "center" }}>
           {isLogin ? "Welcome Back" : "Create Account"}
         </h2>
 
         <form onSubmit={handleSubmit}>
           <label>Email address</label>
+
           <input
             type="email"
             required
@@ -87,6 +120,7 @@ export default function Home() {
           />
 
           <label>Password</label>
+
           <input
             type="password"
             required
@@ -102,19 +136,36 @@ export default function Home() {
             disabled={loading}
             style={buttonStyle}
           >
-            {loading ? "Please wait..." : isLogin ? "Login" : "Register"}
+            {loading
+              ? "Please wait..."
+              : isLogin
+              ? "Login"
+              : "Register"}
           </button>
         </form>
 
         {message && (
-          <p style={{ textAlign: "center", color: "#35d69a" }}>
+          <p
+            style={{
+              textAlign: "center",
+              color: "#35d69a",
+              marginTop: "15px",
+            }}
+          >
             {message}
           </p>
         )}
 
-        <p style={{ textAlign: "center", marginTop: "22px" }}>
-          {isLogin ? "New to Imran?" : "Already have an account?"}
-          {" "}
+        <p
+          style={{
+            textAlign: "center",
+            marginTop: "22px",
+            color: "#b8cfc5",
+          }}
+        >
+          {isLogin
+            ? "New to Imran?"
+            : "Already have an account?"}{" "}
           <button
             onClick={() => {
               setIsLogin(!isLogin);
@@ -125,7 +176,7 @@ export default function Home() {
               border: "none",
               color: "#35d69a",
               cursor: "pointer",
-              fontWeight: "bold"
+              fontWeight: "bold",
             }}
           >
             {isLogin ? "Create account" : "Login"}
@@ -145,7 +196,7 @@ const inputStyle: React.CSSProperties = {
   border: "1px solid #426457",
   background: "#071b16",
   color: "white",
-  boxSizing: "border-box"
+  boxSizing: "border-box",
 };
 
 const buttonStyle: React.CSSProperties = {
@@ -157,5 +208,5 @@ const buttonStyle: React.CSSProperties = {
   color: "#071b16",
   fontWeight: "bold",
   fontSize: "16px",
-  cursor: "pointer"
+  cursor: "pointer",
 };
