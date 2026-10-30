@@ -1,3 +1,4 @@
+
 {
   "name": "imran-app",
   "version": "1.0.0",
@@ -10,7 +11,8 @@
   "dependencies": {
     "next": "latest",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "@supabase/supabase-js": "latest"
   },
   "devDependencies": {
     "typescript": "latest",
